@@ -97,5 +97,10 @@ def serializer_repr(serializer, indent, force_many=None):
 def list_repr(serializer, indent):
     child = serializer.child
     if hasattr(child, 'fields'):
-        return serializer_repr(serializer, indent, force_many=child)
+        return serializer_repr(serializer, indent   , force_many=child)
     return field_repr(serializer)
+
+def dict_repr(serializer, indent): # edit
+    raise NotImplementedError(
+            "dict_repr not implemented."
+        )

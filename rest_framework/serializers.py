@@ -28,12 +28,12 @@ from rest_framework.compat import postgres_fields
 from rest_framework.exceptions import ErrorDetail, ValidationError
 from rest_framework.fields import get_error_detail, set_value
 from rest_framework.settings import api_settings
-from rest_framework.utils import html, model_meta, representation
+from rest_framework.utils import html, model_meta, representation # add representation.dict_repr
 from rest_framework.utils.field_mapping import (
     ClassLookupDict, get_field_kwargs, get_nested_relation_kwargs,
     get_relation_kwargs, get_url_kwargs
 )
-from rest_framework.utils.serializer_helpers import (
+from rest_framework.utils.serializer_helpers import ( # edit: ReturnDict special case
     BindingDict, BoundField, JSONBoundField, NestedBoundField, ReturnDict,
     ReturnList
 )
@@ -1664,3 +1664,216 @@ class HyperlinkedModelSerializer(ModelSerializer):
         field_kwargs = get_nested_relation_kwargs(relation_info)
 
         return field_class, field_kwargs
+
+class DictSerializer(BaseSerializer):
+    child = None
+    many = True
+
+    default_error_messages = {
+        'not_a_list': _('Expected a list of items but got type "{input_type}".'),
+        'empty': _('This list may not be empty.'),
+        #'max_length': _('Ensure this field has no more than {max_length} elements.'),
+        #'min_length': _('Ensure this field has at least {min_length} elements.')
+    }
+
+    def __init__(self, *args, **kwargs):
+        self.child = kwargs.pop('child', copy.deepcopy(self.child))
+        self.allow_empty = kwargs.pop('allow_empty', True)
+        #self.max_length = kwargs.pop('max_length', None)
+        #self.min_length = kwargs.pop('min_length', None)
+        assert self.child is not None, '`child` is a required argument.'
+        assert not inspect.isclass(self.child), '`child` has not been instantiated.'
+        super().__init__(*args, **kwargs)
+        self.child.bind(field_name='', parent=self)
+
+    def get_initial(self):
+        if hasattr(self, 'initial_data'):
+            return self.to_representation(self.initial_data)
+        return []
+
+    def get_value(self, dictionary):
+        """
+        Given the input dictionary, return the field value.
+        """
+        # We override the default field access in order to support
+        # lists in HTML forms.
+        if html.is_html_input(dictionary):
+            return html.parse_html_list(dictionary, prefix=self.field_name, default=empty)
+        return dictionary.get(self.field_name, empty)
+
+    def run_validation(self, data=empty):
+        """
+        We override the default `run_validation`, because the validation
+        performed by validators and the `.validate()` method should
+        be coerced into an error dictionary with a 'non_fields_error' key.
+        """
+        print("Run validation")
+        (is_empty_value, data) = self.validate_empty_values(data)
+        if is_empty_value:
+            return data
+
+        value = self.to_internal_value(data)
+        try:
+            self.run_validators(value)
+            value = self.validate(value)
+            assert value is not None, '.validate() should return the validated data'
+        except (ValidationError, DjangoValidationError) as exc:
+            raise ValidationError(detail=as_serializer_error(exc))
+
+        return value
+
+    def to_internal_value(self, data): # edit: return Dict of dicts
+        """
+        List of dicts of native values <- List of dicts of primitive datatypes.
+        """
+        print("To internal value")
+        if html.is_html_input(data):
+            data = html.parse_html_list(data, default=[])
+
+        if not isinstance(data, list):
+            message = self.error_messages['not_a_list'].format(
+                input_type=type(data).__name__
+            )
+            raise ValidationError({
+                api_settings.NON_FIELD_ERRORS_KEY: [message]
+            }, code='not_a_list')
+
+        if not self.allow_empty and len(data) == 0:
+            message = self.error_messages['empty']
+            raise ValidationError({
+                api_settings.NON_FIELD_ERRORS_KEY: [message]
+            }, code='empty')
+
+        """
+        if self.max_length is not None and len(data) > self.max_length:
+            message = self.error_messages['max_length'].format(max_length=self.max_length)
+            raise ValidationError({
+                api_settings.NON_FIELD_ERRORS_KEY: [message]
+            }, code='max_length')
+
+        if self.min_length is not None and len(data) < self.min_length:
+            message = self.error_messages['min_length'].format(min_length=self.min_length)
+            raise ValidationError({
+                api_settings.NON_FIELD_ERRORS_KEY: [message]
+            }, code='min_length')
+        """
+
+        ret = []
+        #ret = dict()
+        errors = []
+
+        for item in data:
+            try:
+                validated = self.child.run_validation(item)
+            except ValidationError as exc:
+                errors.append(exc.detail)
+            else:
+                ret.append(validated)
+                #ret[item.slug]:validated
+                errors.append({})
+
+        if any(errors):
+            raise ValidationError(errors)
+
+        return ret
+
+    def get_item_key(self, item):
+        raise NotImplementedError(
+            "You must sublcass DictSerializer and define the method for "
+            "determining what to use for the key. If the item to be serialized "
+            "is a model instance, this should be a model field. "
+            "For example: item.slug."
+        )
+
+    def to_representation(self, data): # edit
+        """
+        List of object instances -> List of dicts of primitive datatypes.
+        """
+        print("To representation")
+        # Dealing with nested relationships, data can be a Manager,
+        # so, first get a queryset from the Manager if needed
+        iterable = data.all() if isinstance(data, models.Manager) else data
+        keys = []
+        for item in iterable:
+            key = self.get_item_key(item)
+            if key in keys:
+                raise KeyError(
+                    "The values returned by DictSerializer.get_item_key are not unique."
+                )
+            keys.append(key)
+
+        # edit: return dict
+        #return [
+        #    self.child.to_representation(item) for item in iterable
+        #]
+        return {
+            self.get_item_key(item): self.child.to_representation(item) for item in iterable
+        }
+
+    def validate(self, attrs):
+        return attrs
+
+    def update(self, instance, validated_data):
+        raise NotImplementedError(
+            "Serializers with many=True do not support multiple update by "
+            "default, only multiple create. For updates it is unclear how to "
+            "deal with insertions and deletions. If you need to support "
+            "multiple update, use a `ListSerializer` class and override "
+            "`.update()` so you can specify the behavior exactly."
+        )
+
+    def create(self, validated_data): # edit
+        raise NotImplementedError(
+            "DictSerializer does not support multiple create by default."
+        )
+
+    def save(self, **kwargs): # edit
+        raise NotImplementedError(
+            "DictSerializer does not support multiple save by default."
+        )
+
+    def is_valid(self, raise_exception=False):
+        # This implementation is the same as the default,
+        # except that we use lists, rather than dicts, as the empty case.
+        print("Is valid")
+        assert hasattr(self, 'initial_data'), (
+            'Cannot call `.is_valid()` as no `data=` keyword argument was '
+            'passed when instantiating the serializer instance.'
+        )
+
+        if not hasattr(self, '_validated_data'):
+            try:
+                self._validated_data = self.run_validation(self.initial_data)
+            except ValidationError as exc:
+                self._validated_data = []
+                self._errors = exc.detail
+            else:
+                self._errors = []
+
+        if self._errors and raise_exception:
+            raise ValidationError(self.errors)
+
+        return not bool(self._errors)
+
+    def __repr__(self): # edit: return representation.dict_repr
+        return representation.list_repr(self, indent=1)
+
+    # Include a backlink to the serializer class on return objects.
+    # Allows renderers such as HTMLFormRenderer to get the full field info.
+
+    @property
+    def data(self): # edit: ReturnDict instead of ReturnList
+        ret = super().data
+        return ReturnDict(ret, serializer=self)
+
+    @property
+    def errors(self):
+        ret = super().errors
+        if isinstance(ret, list) and len(ret) == 1 and getattr(ret[0], 'code', None) == 'null':
+            # Edge case. Provide a more descriptive error than
+            # "this field may not be null", when no data is passed.
+            detail = ErrorDetail('No data provided', code='null')
+            ret = {api_settings.NON_FIELD_ERRORS_KEY: [detail]}
+        if isinstance(ret, dict):
+            return ReturnDict(ret, serializer=self)
+        return ReturnList(ret, serializer=self)
